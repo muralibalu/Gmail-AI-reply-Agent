@@ -16,7 +16,7 @@ export const editDraft = (id, draftBody) =>
   api.patch(`/drafts/${id}/edit`, { draft_body: draftBody });
 
 export const regenerateDraft = (id, instructions) =>
-  api.post(`/drafts/${id}/regenerate`, { draft_body: instructions });
+  api.post(`/drafts/${id}/regenerate`, { instructions });
 
 export const approveDraft = (id) => api.post(`/drafts/${id}/approve`);
 
