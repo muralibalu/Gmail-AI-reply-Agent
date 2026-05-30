@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
@@ -44,7 +46,7 @@ def _build_flow() -> Flow:
 
 
 @router.get("/login")
-def login():
+async def login():
     """Redirect user to Google OAuth2 consent screen."""
     logger.info("OAuth2 login initiated — building consent URL")
     try:
@@ -59,7 +61,7 @@ def login():
 
 
 @router.get("/callback")
-def callback(code: str, state: str, db: Session = Depends(get_db)):
+async def callback(code: str, state: str, db: Session = Depends(get_db)):
     """Handle OAuth2 callback — exchange code for tokens and store encrypted."""
     logger.info("OAuth2 callback received — state: %s", state)
 
@@ -68,18 +70,26 @@ def callback(code: str, state: str, db: Session = Depends(get_db)):
         logger.error("No flow found for state=%s — CSRF or expired session", state)
         raise HTTPException(status_code=400, detail="Invalid or expired OAuth2 state")
 
+    # Token exchange: blocking HTTP call — offload to thread
     try:
-        flow.fetch_token(code=code)
+        logger.debug("Exchanging authorization code for tokens (offloaded to thread)")
+        await asyncio.to_thread(flow.fetch_token, code=code)
         creds: Credentials = flow.credentials
         logger.debug("Token exchange successful — expiry: %s", creds.expiry)
     except Exception as e:
         logger.error("Token exchange failed: %s", str(e))
         raise HTTPException(status_code=400, detail="OAuth2 token exchange failed")
 
+    # Userinfo fetch: blocking HTTP call — offload to thread
     try:
+        logger.debug("Fetching userinfo from Google (offloaded to thread)")
         import google.auth.transport.requests
-        session = google.auth.transport.requests.AuthorizedSession(creds)
-        userinfo = session.get("https://www.googleapis.com/oauth2/v2/userinfo").json()
+
+        def _fetch_userinfo():
+            session = google.auth.transport.requests.AuthorizedSession(creds)
+            return session.get("https://www.googleapis.com/oauth2/v2/userinfo").json()
+
+        userinfo = await asyncio.to_thread(_fetch_userinfo)
         email = userinfo["email"]
         logger.info("Verified identity — email: %s | verified: %s",
                     email, userinfo.get("verified_email"))
@@ -87,23 +97,26 @@ def callback(code: str, state: str, db: Session = Depends(get_db)):
         logger.error("Userinfo fetch failed: %s", str(e))
         raise HTTPException(status_code=400, detail="Could not retrieve user info from Google")
 
+    # DB write — offload to thread
     try:
-        user = db.query(User).filter(User.email == email).first()
-        if not user:
-            logger.info("New user — creating record for: %s", email)
-            user = User(email=email)
-            db.add(user)
-        else:
-            logger.info("Existing user — refreshing tokens for: %s", email)
+        def _upsert_user():
+            user = db.query(User).filter(User.email == email).first()
+            if not user:
+                logger.info("New user — creating record for: %s", email)
+                user = User(email=email)
+                db.add(user)
+            else:
+                logger.info("Existing user — refreshing tokens for: %s", email)
+            user.access_token_enc = encrypt_token(creds.token)
+            user.refresh_token_enc = (
+                encrypt_token(creds.refresh_token)
+                if creds.refresh_token else user.refresh_token_enc
+            )
+            user.token_expiry = creds.expiry
+            db.commit()
+            logger.debug("Tokens committed to DB for user: %s", email)
 
-        user.access_token_enc = encrypt_token(creds.token)
-        user.refresh_token_enc = (
-            encrypt_token(creds.refresh_token)
-            if creds.refresh_token else user.refresh_token_enc
-        )
-        user.token_expiry = creds.expiry
-        db.commit()
-        logger.debug("Tokens committed to DB for user: %s", email)
+        await asyncio.to_thread(_upsert_user)
     except Exception as e:
         logger.error("DB error saving tokens for user %s: %s", email, str(e))
         raise HTTPException(status_code=500, detail="Failed to store user session")
@@ -113,12 +126,14 @@ def callback(code: str, state: str, db: Session = Depends(get_db)):
 
 
 @router.post("/logout")
-def logout(user_email: str, db: Session = Depends(get_db)):
+async def logout(user_email: str, db: Session = Depends(get_db)):
     """Revoke Gmail access and clear stored tokens."""
     logger.info("Logout requested for user: %s", user_email)
 
     try:
-        user = db.query(User).filter(User.email == user_email).first()
+        user = await asyncio.to_thread(
+            lambda: db.query(User).filter(User.email == user_email).first()
+        )
         if not user:
             logger.warning("Logout failed — user not found: %s", user_email)
             raise HTTPException(status_code=404, detail="User not found")
@@ -133,10 +148,12 @@ def logout(user_email: str, db: Session = Depends(get_db)):
             import requests as req
             access_token = decrypt_token(user.access_token_enc)
             logger.debug("Revoking Google access token for user: %s", user_email)
-            resp = req.post(
-                "https://oauth2.googleapis.com/revoke",
-                params={"token": access_token},
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            resp = await asyncio.to_thread(
+                lambda: req.post(
+                    "https://oauth2.googleapis.com/revoke",
+                    params={"token": access_token},
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                )
             )
             logger.info("Google revocation response: %s for user: %s",
                         resp.status_code, user_email)
@@ -144,10 +161,13 @@ def logout(user_email: str, db: Session = Depends(get_db)):
             logger.warning("Token revocation failed (continuing logout): %s", str(e))
 
     try:
-        user.access_token_enc = None
-        user.refresh_token_enc = None
-        user.token_expiry = None
-        db.commit()
+        def _clear():
+            user.access_token_enc = None
+            user.refresh_token_enc = None
+            user.token_expiry = None
+            db.commit()
+
+        await asyncio.to_thread(_clear)
         logger.info("Tokens cleared for user: %s", user_email)
     except Exception as e:
         logger.error("DB error clearing tokens for user %s: %s", user_email, str(e))

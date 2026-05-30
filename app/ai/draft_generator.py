@@ -1,30 +1,30 @@
 from typing import List
-from openai import OpenAI
+from openai import AsyncOpenAI
 from app.config import settings
 from app.logger import get_logger
 
 logger = get_logger(__name__)
 
-_client: OpenAI | None = None
+_client: AsyncOpenAI | None = None
 
 
-def _get_client() -> OpenAI:
+def _get_client() -> AsyncOpenAI:
     global _client
     if _client is None:
-        logger.info("Initialising OpenAI client — base_url: %s", settings.openai_base_url)
+        logger.info("Initialising AsyncOpenAI client — base_url: %s", settings.openai_base_url)
         try:
-            _client = OpenAI(
+            _client = AsyncOpenAI(
                 api_key=settings.openai_api_key,
                 base_url=settings.openai_base_url,
             )
-            logger.debug("OpenAI client initialised successfully")
+            logger.debug("AsyncOpenAI client initialised successfully")
         except Exception as e:
-            logger.error("Failed to initialise OpenAI client: %s", str(e))
+            logger.error("Failed to initialise AsyncOpenAI client: %s", str(e))
             raise
     return _client
 
 
-def generate_draft(
+async def generate_draft(
     sender: str,
     subject: str,
     original_body: str,
@@ -32,7 +32,7 @@ def generate_draft(
     sent_email_samples: List[str] = None,
     instructions: str = "",
 ) -> str:
-    """Generate a reply draft using OpenAI — blocking/synchronous."""
+    """Async draft generation via OpenRouter — does not block the event loop."""
     logger.info(
         "Generating draft — from: %s | subject: %s | tone: %s | has_instructions: %s",
         sender, subject, tone, bool(instructions),
@@ -77,10 +77,10 @@ Subject: {subject}
 {instructions_section}"""
 
     client = _get_client()
-    logger.debug("Calling OpenAI API (sync) — base_url: %s", settings.openai_base_url)
+    logger.debug("Sending async request to model — base_url: %s", settings.openai_base_url)
 
     try:
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model="openai/gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -95,5 +95,6 @@ Subject: {subject}
                      response.usage.prompt_tokens, response.usage.completion_tokens)
         return draft
     except Exception as e:
-        logger.error("OpenAI API call failed — subject: %s | error: %s", subject, str(e))
+        logger.error("Async API call failed — base_url: %s | subject: %s | error: %s",
+                     settings.openai_base_url, subject, str(e))
         raise

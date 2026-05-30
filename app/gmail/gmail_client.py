@@ -1,3 +1,4 @@
+import asyncio
 import base64
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -16,7 +17,7 @@ logger = get_logger(__name__)
 
 
 def _get_credentials(user: User) -> Credentials:
-    """Build and refresh Gmail OAuth2 credentials."""
+    """Build and refresh Gmail OAuth2 credentials synchronously."""
     logger.debug("Building Gmail credentials for user: %s", user.email)
     try:
         creds = Credentials(
@@ -42,9 +43,36 @@ def _get_credentials(user: User) -> Credentials:
     return creds
 
 
-def fetch_unread_emails(user: User, max_results: int = 10) -> List[Dict]:
-    """Fetch unread emails from Gmail inbox."""
-    logger.info("Fetching up to %d unread emails for user: %s", max_results, user.email)
+def _fetch_single_email(service, msg_id: str) -> Dict | None:
+    """Fetch one email's full detail. Returns None on failure."""
+    try:
+        detail = service.users().messages().get(
+            userId="me", id=msg_id, format="full"
+        ).execute()
+        headers = {h["name"]: h["value"] for h in detail["payload"]["headers"]}
+        body = _extract_body(detail["payload"])
+        logger.debug(
+            "Fetched email — id: %s | subject: %s | from: %s | body_len: %d",
+            detail["id"], headers.get("Subject", "(none)"),
+            headers.get("From", ""), len(body),
+        )
+        return {
+            "message_id": detail["id"],
+            "thread_id": detail["threadId"],
+            "sender": headers.get("From", ""),
+            "subject": headers.get("Subject", ""),
+            "body": body,
+            "timestamp": detail.get("internalDate"),
+        }
+    except Exception as e:
+        logger.error("Failed to fetch details for message id %s: %s", msg_id, str(e))
+        return None
+
+
+# ── Sync internals (run inside thread pool via asyncio.to_thread) ─────────────
+
+def _sync_fetch_unread_emails(user: User, max_results: int) -> List[Dict]:
+    logger.debug("_sync_fetch_unread_emails started — user: %s | max: %d", user.email, max_results)
     creds = _get_credentials(user)
     service = build("gmail", "v1", credentials=creds)
 
@@ -59,38 +87,15 @@ def fetch_unread_emails(user: User, max_results: int = 10) -> List[Dict]:
     messages = results.get("messages", [])
     logger.info("Found %d unread message(s) in inbox for user: %s", len(messages), user.email)
 
-    emails = []
-    for msg in messages:
-        try:
-            detail = service.users().messages().get(
-                userId="me", id=msg["id"], format="full"
-            ).execute()
-            headers = {h["name"]: h["value"] for h in detail["payload"]["headers"]}
-            body = _extract_body(detail["payload"])
-            logger.debug(
-                "Fetched email — id: %s | subject: %s | from: %s | body_len: %d",
-                detail["id"], headers.get("Subject", "(none)"),
-                headers.get("From", ""), len(body),
-            )
-            emails.append({
-                "message_id": detail["id"],
-                "thread_id": detail["threadId"],
-                "sender": headers.get("From", ""),
-                "subject": headers.get("Subject", ""),
-                "body": body,
-                "timestamp": detail.get("internalDate"),
-            })
-        except Exception as e:
-            logger.error("Failed to fetch details for message id %s: %s", msg["id"], str(e))
-
+    emails = [_fetch_single_email(service, m["id"]) for m in messages]
+    fetched = [e for e in emails if e is not None]
     logger.info("Successfully fetched %d/%d email(s) for user: %s",
-                len(emails), len(messages), user.email)
-    return emails
+                len(fetched), len(messages), user.email)
+    return fetched
 
 
-def fetch_sent_emails(user: User, max_results: int = 10) -> List[str]:
-    """Fetch recent sent emails to learn user's writing style."""
-    logger.info("Fetching up to %d sent emails for style learning — user: %s", max_results, user.email)
+def _sync_fetch_sent_emails(user: User, max_results: int) -> List[str]:
+    logger.debug("_sync_fetch_sent_emails started — user: %s | max: %d", user.email, max_results)
     creds = _get_credentials(user)
     service = build("gmail", "v1", credentials=creds)
 
@@ -121,13 +126,9 @@ def fetch_sent_emails(user: User, max_results: int = 10) -> List[str]:
     return sent
 
 
-def send_reply(user: User, thread_id: str, original_message_id: str,
-               to: str, subject: str, body: str) -> str:
-    """Send an approved draft reply, maintaining thread integrity."""
-    logger.info(
-        "Sending reply — user: %s | to: %s | subject: %s | thread: %s",
-        user.email, to, subject, thread_id,
-    )
+def _sync_send_reply(user: User, thread_id: str, original_message_id: str,
+                     to: str, subject: str, body: str) -> str:
+    logger.debug("_sync_send_reply started — user: %s | to: %s", user.email, to)
     creds = _get_credentials(user)
     service = build("gmail", "v1", credentials=creds)
 
@@ -147,11 +148,35 @@ def send_reply(user: User, thread_id: str, original_message_id: str,
         logger.info("Email sent successfully — Gmail message id: %s", sent["id"])
         return sent["id"]
     except Exception as e:
-        logger.error(
-            "Gmail send API failed — user: %s | thread: %s | error: %s",
-            user.email, thread_id, str(e),
-        )
+        logger.error("Gmail send API failed — user: %s | thread: %s | error: %s",
+                     user.email, thread_id, str(e))
         raise
+
+
+# ── Public async API ──────────────────────────────────────────────────────────
+# Each offloads its blocking Google API call to a thread pool so the
+# FastAPI event loop is never blocked waiting on network I/O.
+
+async def fetch_unread_emails(user: User, max_results: int = 10) -> List[Dict]:
+    """Async wrapper — fetches unread emails without blocking the event loop."""
+    logger.info("Fetching up to %d unread emails for user: %s", max_results, user.email)
+    return await asyncio.to_thread(_sync_fetch_unread_emails, user, max_results)
+
+
+async def fetch_sent_emails(user: User, max_results: int = 10) -> List[str]:
+    """Async wrapper — fetches sent emails without blocking the event loop."""
+    logger.info("Fetching up to %d sent emails for style learning — user: %s", max_results, user.email)
+    return await asyncio.to_thread(_sync_fetch_sent_emails, user, max_results)
+
+
+async def send_reply(user: User, thread_id: str, original_message_id: str,
+                     to: str, subject: str, body: str) -> str:
+    """Async wrapper — sends email without blocking the event loop."""
+    logger.info("Sending reply — user: %s | to: %s | subject: %s | thread: %s",
+                user.email, to, subject, thread_id)
+    return await asyncio.to_thread(
+        _sync_send_reply, user, thread_id, original_message_id, to, subject, body
+    )
 
 
 def _extract_body(payload: Dict) -> str:

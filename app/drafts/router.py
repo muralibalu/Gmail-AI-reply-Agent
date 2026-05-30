@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 from typing import Optional, List
 
@@ -63,8 +64,11 @@ class EmailPreview(BaseModel):
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.get("/inbox", response_model=List[EmailPreview])
-def list_inbox(user_email: str, max_results: int = 20, db: Session = Depends(get_db)):
-    """Fetch unread emails and return previews. No AI called here."""
+async def list_inbox(user_email: str, max_results: int = 20, db: Session = Depends(get_db)):
+    """
+    Fetch unread emails and already-drafted IDs concurrently via asyncio.gather.
+    No AI is called here.
+    """
     logger.info("Inbox fetch requested — user: %s | max: %d", user_email, max_results)
 
     try:
@@ -78,26 +82,24 @@ def list_inbox(user_email: str, max_results: int = 20, db: Session = Depends(get
         logger.error("DB error fetching user %s: %s", user_email, str(e))
         raise HTTPException(status_code=500, detail="Database error")
 
-    # Fetch emails from Gmail — blocks the thread until complete
+    # Fire both operations at the same time — Gmail fetch + DB lookup run concurrently
+    logger.debug("Launching concurrent inbox fetch + DB draft-ID lookup")
     try:
-        emails = fetch_unread_emails(user, max_results=max_results)
+        emails, existing_rows = await asyncio.gather(
+            fetch_unread_emails(user, max_results=max_results),
+            asyncio.to_thread(
+                lambda: db.query(Draft.gmail_message_id)
+                          .filter(Draft.user_email == user_email)
+                          .all()
+            ),
+        )
     except Exception as e:
-        logger.error("Failed to fetch inbox for user %s: %s", user_email, str(e))
+        logger.error("Concurrent inbox fetch failed for user %s: %s", user_email, str(e))
         raise HTTPException(status_code=502, detail="Failed to fetch inbox from Gmail")
 
-    # Fetch existing drafted IDs from DB — also blocks
-    try:
-        existing_ids = {
-            row.gmail_message_id
-            for row in db.query(Draft.gmail_message_id)
-                         .filter(Draft.user_email == user_email)
-                         .all()
-        }
-        logger.debug("Found %d already-drafted message IDs for user: %s",
-                     len(existing_ids), user_email)
-    except Exception as e:
-        logger.error("DB error fetching existing draft IDs: %s", str(e))
-        raise HTTPException(status_code=500, detail="Database error")
+    existing_ids = {row.gmail_message_id for row in existing_rows}
+    logger.debug("Found %d already-drafted message IDs for user: %s",
+                 len(existing_ids), user_email)
 
     previews = [
         EmailPreview(
@@ -116,10 +118,10 @@ def list_inbox(user_email: str, max_results: int = 20, db: Session = Depends(get
 
 
 @router.post("/generate", response_model=List[DraftOut])
-def generate_drafts(payload: GenerateIn, db: Session = Depends(get_db)):
+async def generate_drafts(payload: GenerateIn, db: Session = Depends(get_db)):
     """
-    Generate AI draft replies for selected emails.
-    Emails and AI calls are processed one-by-one (sequential/synchronous).
+    Fetch inbox + sent emails concurrently, then generate all selected drafts
+    concurrently — all AI calls fire at the same time via asyncio.gather.
     """
     logger.info(
         "Draft generation requested — user: %s | tone: %s | selected: %d email(s)",
@@ -143,21 +145,16 @@ def generate_drafts(payload: GenerateIn, db: Session = Depends(get_db)):
     instructions_map = {s.message_id: s.instructions for s in payload.selected}
     selected_ids = set(instructions_map.keys())
 
-    # Fetch inbox — blocks until Gmail responds
-    logger.debug("Fetching inbox emails (blocking) — user: %s", payload.user_email)
+    # Fetch inbox + sent emails in parallel — saves the sequential wait
+    logger.debug("Fetching inbox and sent emails concurrently — user: %s", payload.user_email)
     try:
-        all_emails = fetch_unread_emails(user, max_results=50)
+        all_emails, sent_samples = await asyncio.gather(
+            fetch_unread_emails(user, max_results=50),
+            fetch_sent_emails(user, max_results=10),
+        )
     except Exception as e:
-        logger.error("Gmail inbox fetch failed: %s", str(e))
+        logger.error("Gmail concurrent fetch failed for user %s: %s", payload.user_email, str(e))
         raise HTTPException(status_code=502, detail="Failed to fetch emails from Gmail")
-
-    # Fetch sent samples — blocks again (sequential, not parallel)
-    logger.debug("Fetching sent emails for style context (blocking) — user: %s", payload.user_email)
-    try:
-        sent_samples = fetch_sent_emails(user, max_results=10)
-    except Exception as e:
-        logger.warning("Could not fetch sent samples (continuing): %s", str(e))
-        sent_samples = []
 
     selected_emails = [e for e in all_emails if e["message_id"] in selected_ids]
     logger.debug("Matched %d/%d selected emails in inbox", len(selected_emails), len(selected_ids))
@@ -176,22 +173,21 @@ def generate_drafts(payload: GenerateIn, db: Session = Depends(get_db)):
         logger.error("DB error checking existing drafts: %s", str(e))
         raise HTTPException(status_code=500, detail="Database error")
 
-    created = []
-    skipped = 0
+    to_generate = [e for e in selected_emails if e["message_id"] not in existing_ids]
+    skipped = len(selected_emails) - len(to_generate)
+    if skipped:
+        logger.info("Skipping %d already-drafted email(s)", skipped)
+    if not to_generate:
+        logger.info("All selected emails already have drafts — nothing to generate")
+        return []
 
-    for email in selected_emails:
-        if email["message_id"] in existing_ids:
-            logger.debug("Skipping already-drafted message id: %s", email["message_id"])
-            skipped += 1
-            continue
+    # All AI calls fire simultaneously — total time = slowest single call, not sum
+    logger.info("Generating %d draft(s) concurrently via AsyncOpenAI", len(to_generate))
 
+    async def _generate_one(email: dict) -> tuple[dict, str] | None:
         instructions = instructions_map.get(email["message_id"], "")
-        if instructions:
-            logger.info("User instructions for %s: %s", email["message_id"], instructions)
-
-        # Each AI call blocks until OpenAI responds — done one at a time
         try:
-            body = generate_draft(
+            body = await generate_draft(
                 sender=email["sender"],
                 subject=email["subject"],
                 original_body=email["body"],
@@ -199,11 +195,20 @@ def generate_drafts(payload: GenerateIn, db: Session = Depends(get_db)):
                 sent_email_samples=sent_samples,
                 instructions=instructions,
             )
+            logger.debug("Draft ready for message %s", email["message_id"])
+            return email, body
         except Exception as e:
             logger.error("Draft generation failed for message %s: %s",
                          email["message_id"], str(e))
-            continue
+            return None
 
+    results = await asyncio.gather(*[_generate_one(e) for e in to_generate])
+
+    created = []
+    for result in results:
+        if result is None:
+            continue
+        email, body = result
         try:
             draft = Draft(
                 user_email=payload.user_email,
@@ -228,19 +233,19 @@ def generate_drafts(payload: GenerateIn, db: Session = Depends(get_db)):
 
     logger.info(
         "Generation complete — created: %d | skipped: %d | failed: %d | user: %s",
-        len(created), skipped,
-        len(selected_emails) - skipped - len(created),
-        payload.user_email,
+        len(created), skipped, len(to_generate) - len(created), payload.user_email,
     )
     return created
 
 
 @router.get("/", response_model=List[DraftOut])
-def list_drafts(user_email: str, db: Session = Depends(get_db)):
+async def list_drafts(user_email: str, db: Session = Depends(get_db)):
     """List all drafts for a user."""
     logger.info("Listing drafts for user: %s", user_email)
     try:
-        drafts = db.query(Draft).filter(Draft.user_email == user_email).all()
+        drafts = await asyncio.to_thread(
+            lambda: db.query(Draft).filter(Draft.user_email == user_email).all()
+        )
         logger.debug("Returned %d draft(s) for user: %s", len(drafts), user_email)
         return drafts
     except Exception as e:
@@ -249,10 +254,12 @@ def list_drafts(user_email: str, db: Session = Depends(get_db)):
 
 
 @router.get("/{draft_id}", response_model=DraftOut)
-def get_draft(draft_id: int, db: Session = Depends(get_db)):
+async def get_draft(draft_id: int, db: Session = Depends(get_db)):
     logger.debug("Fetching draft id: %d", draft_id)
     try:
-        draft = db.query(Draft).filter(Draft.id == draft_id).first()
+        draft = await asyncio.to_thread(
+            lambda: db.query(Draft).filter(Draft.id == draft_id).first()
+        )
         if not draft:
             logger.warning("Draft not found — id: %d", draft_id)
             raise HTTPException(status_code=404, detail="Draft not found")
@@ -265,8 +272,8 @@ def get_draft(draft_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{draft_id}/regenerate", response_model=DraftOut)
-def regenerate_draft(draft_id: int, payload: EditDraftIn, db: Session = Depends(get_db)):
-    """Regenerate draft body with new instructions — sequential/blocking."""
+async def regenerate_draft(draft_id: int, payload: EditDraftIn, db: Session = Depends(get_db)):
+    """Regenerate draft body with new instructions — async AI call."""
     logger.info("Regenerate requested for draft id: %d", draft_id)
 
     try:
@@ -276,7 +283,6 @@ def regenerate_draft(draft_id: int, payload: EditDraftIn, db: Session = Depends(
             raise HTTPException(status_code=404, detail="Draft not found")
         if draft.status == DraftStatus.sent:
             raise HTTPException(status_code=400, detail="Cannot regenerate a sent draft")
-
         user = db.query(User).filter(User.email == draft.user_email).first()
         if not user or not user.access_token_enc:
             raise HTTPException(status_code=401, detail="User not authenticated")
@@ -289,16 +295,14 @@ def regenerate_draft(draft_id: int, payload: EditDraftIn, db: Session = Depends(
     instructions = payload.draft_body
     logger.info("Regenerating draft id %d — instructions: %s", draft_id, instructions)
 
-    # Fetch sent samples — blocks
     try:
-        sent_samples = fetch_sent_emails(user, max_results=10)
+        sent_samples = await fetch_sent_emails(user, max_results=10)
     except Exception as e:
-        logger.warning("Could not fetch sent samples for regeneration (continuing): %s", str(e))
+        logger.warning("Could not fetch sent samples (continuing): %s", str(e))
         sent_samples = []
 
-    # AI call — blocks
     try:
-        new_body = generate_draft(
+        new_body = await generate_draft(
             sender=draft.sender,
             subject=draft.subject or "",
             original_body=draft.original_body or "",
@@ -324,8 +328,7 @@ def regenerate_draft(draft_id: int, payload: EditDraftIn, db: Session = Depends(
 
 
 @router.patch("/{draft_id}/edit", response_model=DraftOut)
-def edit_draft(draft_id: int, payload: EditDraftIn, db: Session = Depends(get_db)):
-    """Edit a draft body manually."""
+async def edit_draft(draft_id: int, payload: EditDraftIn, db: Session = Depends(get_db)):
     logger.info("Edit requested for draft id: %d", draft_id)
     try:
         draft = _get_pending_draft(draft_id, db)
@@ -346,8 +349,7 @@ def edit_draft(draft_id: int, payload: EditDraftIn, db: Session = Depends(get_db
 
 
 @router.post("/{draft_id}/approve", response_model=DraftOut)
-def approve_draft(draft_id: int, db: Session = Depends(get_db)):
-    """Approve a draft for sending."""
+async def approve_draft(draft_id: int, db: Session = Depends(get_db)):
     logger.info("Approval requested for draft id: %d", draft_id)
     try:
         draft = _get_pending_draft(draft_id, db)
@@ -366,8 +368,7 @@ def approve_draft(draft_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{draft_id}/reject", response_model=DraftOut)
-def reject_draft(draft_id: int, db: Session = Depends(get_db)):
-    """Reject a draft."""
+async def reject_draft(draft_id: int, db: Session = Depends(get_db)):
     logger.info("Rejection requested for draft id: %d", draft_id)
     try:
         draft = _get_pending_draft(draft_id, db)
@@ -386,8 +387,7 @@ def reject_draft(draft_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{draft_id}/send", response_model=DraftOut)
-def send_draft(draft_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    """Queue an approved draft for sending in the background."""
+async def send_draft(draft_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     logger.info("Send requested for draft id: %d", draft_id)
     try:
         draft = db.query(Draft).filter(Draft.id == draft_id).first()
@@ -398,18 +398,15 @@ def send_draft(draft_id: int, background_tasks: BackgroundTasks, db: Session = D
             logger.warning("Send rejected — draft id %d has invalid status: %s",
                            draft_id, draft.status)
             raise HTTPException(status_code=400, detail="Only approved drafts can be sent")
-
         if not draft.send_idempotency_key:
             draft.send_idempotency_key = str(uuid.uuid4())
             db.commit()
             logger.debug("Assigned idempotency key to draft id %d: %s",
                          draft_id, draft.send_idempotency_key)
-
         user = db.query(User).filter(User.email == draft.user_email).first()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
-
-        logger.info("Queuing background send task for draft id: %d", draft_id)
+        logger.info("Queuing async background send task for draft id: %d", draft_id)
         background_tasks.add_task(_send_with_retry, draft.id, user, db)
         return draft
     except HTTPException:
@@ -433,8 +430,8 @@ def _get_pending_draft(draft_id: int, db: Session) -> Draft:
     return draft
 
 
-def _send_with_retry(draft_id: int, user: User, db: Session):
-    """Background task — send with retries, sequential/blocking."""
+async def _send_with_retry(draft_id: int, user: User, db: Session):
+    """Async background task — send with retries, non-blocking Gmail call."""
     try:
         draft = db.query(Draft).filter(Draft.id == draft_id).first()
         if not draft:
@@ -444,15 +441,13 @@ def _send_with_retry(draft_id: int, user: User, db: Session):
         logger.error("DB error fetching draft for background send — id %d: %s", draft_id, str(e))
         return
 
-    logger.info(
-        "Background send started — draft id: %d | max attempts: %d | user: %s",
-        draft_id, MAX_SEND_RETRIES, user.email,
-    )
+    logger.info("Background send started — draft id: %d | max attempts: %d | user: %s",
+                draft_id, MAX_SEND_RETRIES, user.email)
 
     for attempt in range(1, MAX_SEND_RETRIES + 1):
         logger.info("Send attempt %d/%d for draft id: %d", attempt, MAX_SEND_RETRIES, draft_id)
         try:
-            send_reply(
+            await send_reply(
                 user=user,
                 thread_id=draft.thread_id,
                 original_message_id=draft.gmail_message_id,
@@ -461,10 +456,8 @@ def _send_with_retry(draft_id: int, user: User, db: Session):
                 body=draft.draft_body,
             )
             draft.status = DraftStatus.sent
-            db.add(SendLog(
-                draft_id=draft.id, user_email=draft.user_email,
-                attempt=attempt, status="success",
-            ))
+            db.add(SendLog(draft_id=draft.id, user_email=draft.user_email,
+                           attempt=attempt, status="success"))
             db.commit()
             logger.info("Draft id %d sent successfully on attempt %d", draft_id, attempt)
             return
@@ -472,10 +465,8 @@ def _send_with_retry(draft_id: int, user: User, db: Session):
             logger.error("Send attempt %d/%d failed for draft id %d: %s",
                          attempt, MAX_SEND_RETRIES, draft_id, str(e))
             try:
-                db.add(SendLog(
-                    draft_id=draft.id, user_email=draft.user_email,
-                    attempt=attempt, status="failed", error_message=str(e),
-                ))
+                db.add(SendLog(draft_id=draft.id, user_email=draft.user_email,
+                               attempt=attempt, status="failed", error_message=str(e)))
                 db.commit()
             except Exception as db_err:
                 logger.error("Failed to write SendLog for attempt %d: %s", attempt, str(db_err))
