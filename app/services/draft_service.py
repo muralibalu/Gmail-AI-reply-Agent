@@ -245,14 +245,30 @@ class DraftService:
         draft = self._draft_repo.get_by_id(draft_id)
         if not draft:
             raise DraftNotFoundError(f"Draft {draft_id} not found")
+
+        # Guard: if already sent, hard reject
+        if draft.status == DraftStatus.sent:
+            raise DraftAlreadySentError()
+
+        # Guard: idempotency key present means send was already queued —
+        # reject even if status hasn't flipped to 'sent' yet (background task in-flight)
+        if draft.send_idempotency_key:
+            logger.warning(
+                "DraftService.queue_send — duplicate send attempt blocked | draft: %d | key: %s",
+                draft_id, draft.send_idempotency_key,
+            )
+            raise DraftAlreadySentError("Send already queued or completed for this draft")
+
+        # Only approved/edited drafts can be sent
         if draft.status not in (DraftStatus.approved, DraftStatus.edited):
             raise InvalidDraftStatusError()
-        if not draft.send_idempotency_key:
-            draft = await asyncio.to_thread(
-                self._draft_repo.set_idempotency_key, draft, str(uuid.uuid4())
-            )
-            logger.debug("DraftService.queue_send — idempotency key assigned: %s",
-                         draft.send_idempotency_key)
+
+        # Assign idempotency key — this is the single atomic gate against double-sends
+        draft = await asyncio.to_thread(
+            self._draft_repo.set_idempotency_key, draft, str(uuid.uuid4())
+        )
+        logger.info("DraftService.queue_send — idempotency key assigned: %s | draft: %d",
+                    draft.send_idempotency_key, draft_id)
         return draft
 
     async def send_with_retry(self, draft_id: int) -> None:

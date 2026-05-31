@@ -1,0 +1,36 @@
+# ── What is .dockerignore? ────────────────────────────────────────────────────
+# When Docker builds an image, it sends all files in the build context
+# to the Docker daemon. .dockerignore tells it what to skip.
+# This makes builds faster and prevents secrets leaking into the image.
+
+# Python virtual environment — never copy this, Docker installs fresh
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Database files — these live in the volume, not the image
+*.db
+*.sqlite3
+data/
+
+# Logs — these are mounted as a volume
+logs/
+
+# Git history — not needed inside the container
+.git/
+.gitignore
+
+# Environment file — injected at runtime via docker-compose env_file
+# NEVER bake .env into the image (it would be visible to anyone who pulls it)
+.env
+
+# Frontend build artifacts and node_modules (frontend has its own Dockerfile)
+frontend/node_modules/
+frontend/dist/
+
+# Editor/OS files
+.DS_Store
+*.swp

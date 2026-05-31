@@ -1,6 +1,11 @@
 import axios from "axios";
 
-const api = axios.create({ baseURL: "http://localhost:8000" });
+// In Docker: Nginx serves the frontend on port 80 and proxies /auth/ and /drafts/
+// to the backend container. Using relative baseURL means API calls go to the
+// same origin — Nginx picks them up and forwards automatically.
+// Locally (npm run dev): Vite dev server runs on 5173, so we need the full URL.
+const baseURL = import.meta.env.VITE_API_URL || "";
+const api = axios.create({ baseURL });
 
 export const getDrafts = (userEmail) =>
   api.get("/drafts/", { params: { user_email: userEmail } });
