@@ -1,0 +1,36 @@
+# ── Stage 1: Base image ───────────────────────────────────────────────────────
+# We start from an official Python image. "3.11-slim" means:
+#   - Python 3.11 pre-installed
+#   - "slim" = minimal OS, no bloat (smaller image size)
+FROM python:3.11-slim
+
+# ── Set working directory ─────────────────────────────────────────────────────
+# All subsequent commands run inside /app inside the container.
+# Think of it as: cd /app
+WORKDIR /app
+
+# ── Install dependencies FIRST (before copying code) ─────────────────────────
+# Why copy requirements.txt separately before copying all code?
+# Docker builds in layers. If requirements.txt hasn't changed, Docker
+# reuses the cached "pip install" layer and skips it — much faster rebuilds.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ── Copy application code ─────────────────────────────────────────────────────
+# Now copy everything else. This layer changes often (code changes),
+# but the pip install layer above is already cached.
+COPY . .
+
+# ── Create directories the app needs ─────────────────────────────────────────
+RUN mkdir -p logs data
+
+# ── Expose port ───────────────────────────────────────────────────────────────
+# Tells Docker "this container listens on port 8000".
+# This doesn't publish the port — docker-compose does that.
+EXPOSE 8000
+
+# ── Start command ─────────────────────────────────────────────────────────────
+# This runs when the container starts.
+# --host 0.0.0.0 means "accept connections from outside the container"
+# (default 127.0.0.1 would block all external traffic inside Docker network)
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

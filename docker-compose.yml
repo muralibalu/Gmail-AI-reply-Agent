@@ -1,0 +1,66 @@
+version: "3.9"
+
+# ── What is a service? ────────────────────────────────────────────────────────
+# Each "service" is one container. We have two: backend and frontend.
+# Docker Compose starts them both, connects them on the same network,
+# and lets them talk to each other by service name (e.g. "backend").
+
+services:
+
+  # ── Backend (FastAPI) ───────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .                      # Build from root folder
+      dockerfile: Dockerfile.backend  # Using this Dockerfile
+    container_name: draftly-backend
+
+    # env_file loads your .env into the container's environment.
+    # The container sees OPENAI_API_KEY, GMAIL_CLIENT_ID, etc.
+    # Your .env is never baked into the image — it's injected at runtime.
+    env_file:
+      - .env
+
+    ports:
+      - "8000:8000"   # host_port:container_port — exposes backend to your browser too
+
+    volumes:
+      # Named volume for SQLite database file.
+      # Without this: every time the container restarts, the DB is wiped.
+      # With this: data persists between restarts on your machine.
+      - draftly-data:/app/data
+
+      # Mount logs folder so you can read logs from your host machine
+      - ./logs:/app/logs
+
+    # Restart policy: if the backend crashes, Docker restarts it automatically
+    restart: unless-stopped
+
+    # Health check: Docker pings /docs every 30s to confirm backend is alive
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Frontend (React + Nginx) ────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend             # Build from the frontend folder
+      dockerfile: ../Dockerfile.frontend
+    container_name: draftly-frontend
+
+    ports:
+      - "80:80"       # Serve on port 80 (standard HTTP) — open localhost in browser
+
+    depends_on:
+      - backend       # Docker starts backend first before frontend
+
+    restart: unless-stopped
+
+
+# ── Named volumes ─────────────────────────────────────────────────────────────
+# Volumes are persistent storage managed by Docker.
+# "draftly-data" lives on your machine at /var/lib/docker/volumes/draftly-data
+# It survives container restarts and rebuilds.
+volumes:
+  draftly-data:
